@@ -1,0 +1,289 @@
+```{r}
+library(tidyverse)
+library(synExtra)
+
+synapser::synLogin()
+syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+
+```{r}
+dge_gmt <- map(
+  c("syn20820056", "syn20820060"),
+  ~syn(.x) %>%
+    DRIAD::read_gmt()
+) %>%
+  enframe("experiment", "gene_sets") %>%
+  mutate(
+    gene_sets = map(gene_sets, ~enframe(.x, "drug", "genes"))
+  ) %>%
+  unnest(gene_sets)
+
+
+drug_meta <- syn("syn11801537") %>%
+  read_csv()
+
+drugs_of_interest <- drug_meta %>%
+  filter(
+    name %in% c(
+      "Ruxolitinib", "Baricitinib", "Tofacitinib", "Nilotinib", "Vorinostat", "NVP-TAE684"
+    )
+  )
+
+dge_gmt_of_interest <- dge_gmt %>%
+  inner_join(
+    drugs_of_interest,
+    by = c("drug" = "lincs_id")
+  )
+
+```
+
+```{r}
+msbb_quant_clinical <- syn("syn50618978") %>%
+  read_csv()
+
+gene_universe <- colnames(msbb_quant_clinical) %>%
+  setdiff(
+    c("ID", "brain_region", "PMI", "AOD", "CDR",
+      "Braak", "Barcode", "Label", "individualID")
+  )
+
+msbb_quant_mat <- msbb_quant_clinical %>%
+  dplyr::select(ID, all_of(gene_universe)) %>%
+  column_to_rownames("ID") %>%
+  as.matrix() %>%
+  {log10(. + min(.[. > 0]))}
+```
+
+
+
+```{r}
+gene_means <- msbb_quant_mat %>%
+  apply(2, mean)
+gene_sds <- msbb_quant_mat %>%
+  apply(2, sd)
+
+N_PATIENTS <- 200
+
+gene_weights <- dge_gmt_of_interest %>%
+  transmute(
+    experiment, drug, genes, name,
+    hit_strength = c(
+      .2, .9, .3, .2, 1, .4, .1, .7
+    )
+  ) %>%
+  unchop(genes) %>%
+  group_by(genes) %>%
+  slice_max(hit_strength, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(
+    stage_split = rnorm(n(), .5, .2) %>%
+      pmin(.9) %>%
+      pmax(.1)
+  ) %>%
+  bind_rows(
+    tibble(genes = setdiff(gene_universe, .$genes))
+  ) %>%
+  replace_na(list(hit_strength = 0)) %>%
+  slice(match(gene_universe, genes))
+
+withr::with_seed(
+  42,
+  patients <- tibble(
+    patient_id = paste("patient", seq_len(N_PATIENTS), sep = "_"),
+    tdp43_status = c(rep_len("TDP43+", N_PATIENTS / 2), rep_len("TDP43-", N_PATIENTS / 2)),
+    stage = factor(
+      sample(c("1", "2", "3"), N_PATIENTS, replace = TRUE),
+      levels = c("1", "2", "3")
+    )
+  )
+)
+
+write_csv(
+  patients,
+  "sim_patients.csv.gz"
+)
+
+counts_long <- withr::with_seed(
+  42,
+  gene_weights %>%
+  transmute(
+    gene = genes,
+    hit_strength,
+    stage_split,
+    direction = if_else(runif(n()) > .5, 1, -1)
+  ) %>%
+  cross_join(
+    patients
+  ) %>%
+  inner_join(
+    enframe(gene_means, "gene", "mean"),
+    by = "gene"
+  ) %>%
+  inner_join(
+    enframe(gene_sds, "gene", "sd"),
+    by = "gene"
+  ) %>%
+  replace_na(list(stage_split = .5)) %>%
+  mutate(
+    shift_strength_tdp43 = case_match(
+      tdp43_status,
+      "TDP43+" ~ rnorm(n() , 1, .2),
+      "TDP43-" ~ rnorm(n(), 0, .2)
+    ),
+    mean_shift = case_match(
+      stage,
+      "1" ~ 0,
+      "2" ~ stage_split,
+      "3" ~ 1
+    ) * hit_strength * shift_strength_tdp43 * direction,
+    mean_total = mean + mean_shift,
+    count = rnorm(n(), mean_total, sd)
+  )
+)
+
+write_csv(
+  counts_long,
+  "sim_counts_long.csv.gz"
+)
+
+sim_counts_mat <- counts_long %>%
+  select(patient_id, gene, count) %>%
+  pivot_wider(names_from = patient_id, values_from = count) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+
+```
+
+```{r}
+library(ComplexHeatmap)
+library(seriation)
+library(impute)
+
+cluster_fun_eucl <- function(mat, sample_in_col = TRUE) {
+  # if (!sample_in_col) {
+  #   mat <- t(mat)
+  # }
+  # mat_imp <- impute.knn(
+  #   mat, rng.seed = 42
+  # )[["data"]]
+  # if (!sample_in_col) {
+  #   mat_imp <- t(mat_imp)
+  #   mat <- t(mat)
+  # }
+  # browser()
+  dist_mat <- dist(mat)
+  # dist_mat <- as.dist(mat)
+  clust <- hclust(dist_mat, method = "average")
+  reorder(clust, dist_mat, method = "OLO")
+}
+
+
+createAnnotation <- function(df, colors = list(), which = "column") {
+  # Load necessary libraries
+  color_maps <- list()
+
+  # Iterate over each column in the dataframe
+  for (col_name in names(df)) {
+    # Check if the column is numeric
+    if (is.numeric(df[[col_name]])) {
+      # Create a color mapping function for numeric columns
+      if (is.null(colors[[col_name]]))
+        colors[[col_name]] <- c("white", "red")
+      if (is.function(colors[[col_name]])) {
+        col_fun <- colors[[col_name]]
+      } else if (is.character(colors[[col_name]])) {
+        n <- length(colors[[col_name]])
+        if (n == 1) {
+          col_fun <- circlize::colorRamp2(
+            seq(from = min(df[[col_name]]), to = max(df[[col_name]]), length.out = 100),
+            viridis(100, option = colors[[col_name]])
+          )
+        } else {
+          col_fun <- circlize::colorRamp2(
+            seq(from = min(df[[col_name]]), to = max(df[[col_name]]), length.out = n),
+            colors[[col_name]]
+          )
+        }
+      } else
+        stop("Dont know how to handle colors for column ", col_name)
+      color_maps[[col_name]] <- col_fun
+    } else {
+      if (is.character(colors[[col_name]])) {
+        color_maps[[col_name]] <- colors[[col_name]]
+        next
+      }
+      col_fun <- colors[[col_name]] %||% rainbow
+      # Create a named vector of colors for categorical columns
+      values <- df[[col_name]]
+      unique_values <- if (is.factor(values)) levels(values) else unique(df[[col_name]])
+      named_colors <- setNames(col_fun(length(unique_values)), unique_values)
+      color_maps[[col_name]] <- named_colors
+    }
+  }
+
+  # Combine all annotations
+  combined_annotations <- HeatmapAnnotation(df = df, col = color_maps, which = which)
+
+  return(combined_annotations)
+}
+```
+
+
+```{r}
+library(ComplexHeatmap)
+
+hm <- Heatmap(
+  sim_counts,
+  name = "log10(counts)",
+  cluster_rows = cluster_fun_eucl,
+  cluster_columns = cluster_fun_eucl,
+  show_row_names = FALSE,
+  show_column_names = FALSE,
+  top_annotation = createAnnotation(
+    patients %>%
+      column_to_rownames("patient_id"),
+    which = "column"
+  )
+)
+
+withr::with_pdf(
+  "plots/sim_counts_heatmap.pdf",
+  {
+    draw(hm)
+  }, width = 10, height = 20
+)
+
+sim_counts_subset <- sim_counts_mat[
+  gene_sds != 0,
+]
+
+most_var <- matrixStats::rowVars(sim_counts_subset) %>%
+  sort(decreasing = TRUE)
+
+hm <- Heatmap(
+  sim_counts_subset[do.call(c, dge_gmt_of_interest$genes) %>% unique() %>% intersect(rownames(sim_counts_subset)),] %>%
+    t() %>%
+    scale() %>%
+    t(),
+  name = "log10(counts)",
+  cluster_rows = cluster_fun_eucl,
+  cluster_columns = cluster_fun_eucl,
+  show_row_names = FALSE,
+  show_column_names = FALSE,
+  top_annotation = createAnnotation(
+    patients %>%
+      column_to_rownames("patient_id"),
+    which = "column"
+  )
+)
+
+withr::with_pdf(
+  "plots/sim_counts_heatmap_scaled.pdf",
+  {
+    draw(hm)
+  }, width = 10, height = 20
+)
+```
+
