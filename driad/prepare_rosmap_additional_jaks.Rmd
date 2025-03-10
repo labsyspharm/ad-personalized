@@ -21,6 +21,14 @@ dir.create(data_dir, showWarnings = FALSE)
 ```
 
 
+Requires `ordinal_regression` branch of DRIAD.
+https://github.com/clemenshug/DRIAD/tree/ordinal_regression
+
+```{r eval=FALSE}
+remotes::install_github("clemenshug/DRIAD", ref = "ordinal_regression")
+remotes::install_github("labsyspharm/ordinalRidge")
+```
+
 
 syn51671579 - From 1-20230210-ReN-ovca-mel-test
 syn51722827 - From 2-20230412-ReN-AD-repurposing-Albers
@@ -135,45 +143,6 @@ rosmap_quant_clinical_split <- rosmap_quant_clinical %>%
   group_nest(brain_region, classification, class)
 ```
 
-
-```{r}
-
-dge_gmt <- map(
-  c("syn20820056", "syn20820060"),
-  ~syn(.x) %>%
-    DRIAD::read_gmt()
-) %>%
-  enframe("experiment", "gene_sets") %>%
-  mutate(
-    gene_sets = map(gene_sets, ~enframe(.x, "drug", "genes"))
-  ) %>%
-  unnest(gene_sets)
-
-
-drug_meta <- syn("syn11801537") %>%
-  read_csv()
-
-drugs_of_interest <- drug_meta %>%
-  filter(
-    name %in% c(
-      "Ruxolitinib", "Baricitinib", "Tofacitinib", "Nilotinib", "Vorinostat", "NVP-TAE684"
-    )
-  )
-
-dge_gmt_of_interest <- dge_gmt %>%
-  inner_join(
-    drugs_of_interest,
-    by = c("drug" = "lincs_id")
-  )
-
-gmt_genes <- dge_gmt_of_interest$genes %>%
-  reduce(union)
-setdiff(gmt_genes, colnames(rosmap_quant_clinical))
-
-gene_set_sizes <- map_int(dge_gmt_of_interest$genes, length) %>%
-  unique()
-
-```
 
 
 Re-use prediction tasks created for chromatin modifier run
