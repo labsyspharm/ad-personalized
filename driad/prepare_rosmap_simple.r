@@ -120,13 +120,65 @@ background_gene_sets <- tibble(
 # Try running DRIAD on a single gene set
 sample_res <- DRIAD::evalGeneSets(
   background_gene_sets %>%
-    head(10) %>%
+    head(1) %>%
     pull(genes),
   prediction_task,
   prediction_task_pairs,
   nBK = 0,
   method = "or"
 )
+
+# Try running on a bunch of example gene sets to estimate
+# running time based on number of genes
+set.seed(42)
+running_time_jobs <- background_gene_sets %>%
+  group_by(gene_set_size) %>%
+  slice_sample(n = 2) %>%
+  ungroup()
+
+running_times_raw <- running_time_jobs %>%
+  mutate(
+    res = map(
+      genes,
+      \(x) {
+        start <- proc.time()["elapsed"]
+        res <- DRIAD::evalGeneSets(
+          list(x),
+          prediction_task,
+          prediction_task_pairs,
+          nBK = 0,
+          method = "or"
+        )
+        end <- proc.time()["elapsed"]
+        list(
+          seconds_elapsed = end - start,
+          res = res
+        )
+      }
+    )
+  )
+
+qsave(
+  running_times_raw,
+  file.path("driad", "rosmap_simple_running_times_raw.qs")
+)
+
+running_times <- running_times_raw %>%
+  unnest_wider(res) %>%
+  select(gene_set_size, seconds_elapsed)
+
+p <- ggplot(
+  running_times,
+  aes(gene_set_size, seconds_elapsed)
+) +
+  geom_point() +
+  geom_smooth(method = "lm")
+
+ggsave(
+  file.path("driad_plots", "rosmap_simple_running_times.pdf"),
+  p, width = 6, height = 4
+)
+
 
 DRIAD::evalGeneSets(
   background_gene_sets %>% filter(id == "prediction_task_11") %>% pull(genes) %>% head(n = 1),

@@ -304,7 +304,7 @@ p <- rosmap_classification %>%
 
 ggsave(
   "plots/rosmap_classification_n_samples.pdf", width = 4, height = 3
-)
+)ß
 
 p <- rosmap_classification %>%
   mutate(

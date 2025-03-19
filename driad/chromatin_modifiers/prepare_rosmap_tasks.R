@@ -52,12 +52,13 @@ rosmap_quant_clinical_split <- rosmap_quant_clinical %>%
     )
   ) %>% {
     bind_rows(
-      select(., -class_high) %>%
-        rename(class = class_low) %>%
-        mutate(classification = "low_threshold"),
-      select(., -class_low) %>%
-        rename(class = class_high) %>%
-        mutate(classification = "high_threshold"),
+      low_threshold = select(., -class_high) %>%
+        rename(class = class_low),
+      high_threshold = select(., -class_low) %>%
+        rename(class = class_high),
+      all = select(., -class_low, -class_high) %>%
+        mutate(class = "all"),
+      .id = "classification"
     )
   } %>%
   group_nest(brain_region, classification, class)
@@ -83,7 +84,8 @@ prediction_tasks <- rosmap_quant_clinical_split %>%
   ) %>%
   # Only use conditions that worked best in cross-validation
   filter(
-    brain_region == "PCC"
+    brain_region == "PCC",
+    classification != "all"
   ) %>%
   mutate(
     task = map2(data, comparison, prepare_task)
@@ -184,6 +186,7 @@ qsave(
   background_gene_sets,
   file.path(data_dir, "background_gene_sets.qs")
 )
+# background_gene_sets <- qread(file.path(data_dir, "background_gene_sets.qs"))
 
 compound_gene_sets <- chrom_mod_sig %>%
   mutate(
@@ -194,6 +197,7 @@ qsave(
   compound_gene_sets,
   file.path(data_dir, "compound_gene_sets.qs")
 )
+# compound_gene_sets <- qread(file.path(data_dir, "compound_gene_sets.qs"))
 
 combined_gene_sets <- bind_rows(
   compound = compound_gene_sets,
@@ -457,8 +461,261 @@ fwrite(
 
 synStoreMany(
   c(
-    file.path(data_dir, "compound_and_background_res.csv.gz")
+    file.path(
+      data_dir,
+      c(
+        "compound_and_background_res.csv.gz",
+        "prediction_task_gene_set_pairs.qs",
+        "background_gene_sets.qs",
+        "prediction_tasks.qs"
+      )
+    )
   ),
+  "syn63901091",
+  forceVersion = FALSE
+)
+
+
+set.seed(42)
+prediction_tasks_all <- rosmap_quant_clinical_split %>%
+  crossing(
+    comparison = c("all", "all_pooled")
+  ) %>%
+  # Only use conditions that worked best in cross-validation
+  filter(
+    brain_region == "PCC",
+    classification == "all"
+  ) %>%
+  mutate(
+    task = map2(data, comparison, prepare_task)
+  ) %>%
+  select(-data) %>%
+  mutate(
+    task_id = paste("prediction_task", brain_region, classification, class, comparison, sep = "_"),
+    task_path = file.path(data_dir, paste0(task_id, ".qs")),
+    pairs = map(task, DRIAD::preparePairs)
+  )
+
+dir.create(data_dir, showWarnings = FALSE)
+qsave(
+  prediction_tasks_all, file.path(data_dir, "prediction_tasks_all_only.qs")
+)
+# prediction_tasks_all <- qread("driad/prediction_tasks_all_only.qs")
+
+pwalk(
+  prediction_tasks_all,
+  function(task, pairs, task_path, ...) {
+    # browser()
+    x <- list(task = task, pairs = pairs)
+    qsave(
+      x,
+      task_path
+      # compress = "xz"
+    )
+  }
+)
+
+
+prediction_task_gene_set_pairs_all <- cross_join(
+  prediction_tasks_all %>%
+    select(-c(task, pairs)),
+  combined_gene_sets_selected
+)
+
+qsave(
+  prediction_task_gene_set_pairs_all,
+  file.path(data_dir, "prediction_task_gene_set_pairs_all_only.qs")
+)
+# prediction_task_gene_set_pairs_all <- qread(file.path(data_dir, "prediction_task_gene_set_pairs_all_only.qs"))
+
+set.seed(42)
+prediction_task_gene_set_pairs_all_performance_selected <- prediction_task_gene_set_pairs_all %>%
+  group_by(
+    task_id, gene_set_size
+  ) %>%
+  slice_sample(n = 2) %>%
+  ungroup() %>%
+  mutate(
+    gene_sets = map2(genes, gs_id, \(x, y) set_names(list(dummy = x), y))
+  )
+
+library(batchtools)
+
+reg <- makeRegistry(
+  file.dir = here(paste0("registry_chromatin_modifier_all_run_time", gsub(" ", "_", Sys.time()))),
+  seed = 1
+)
+# reg <- loadRegistry("reg  ")
+
+batchMap(
+  fun = run_pred_job,
+  task_path = prediction_task_gene_set_pairs_all_performance_selected$task_path,
+  gene_sets = prediction_task_gene_set_pairs_all_performance_selected$gene_sets,
+  reg = reg
+)
+
+# run_bk_job(
+#   task_id = prediction_tasks_gene_sets[1:5,][["id"]][[1]],
+#   background_sets = prediction_tasks_gene_sets[1:5,][["background_sets"]][[1]],
+#   background_task_id = prediction_tasks_gene_sets[1:5,][["background_task_id"]][[1]]
+# )
+
+job_table <- findJobs(reg = reg) %>%
+  # Chunk jobs into a single array job
+  mutate(chunk = 1)
+
+submitJobs(
+  job_table,
+  resources = list(
+    memory = "4gb",
+    ncpus = 1L,
+    partition = "short",
+    walltime = 30*60,
+    chunks.as.arrayjobs = TRUE
+  )
+)
+
+running_times_raw <- getJobTable(findDone(reg = reg), reg = reg) %>%
+  bind_cols(
+    prediction_task_gene_set_pairs_all_performance_selected
+  )
+
+qsave(
+  running_times_raw,
+  file.path(data_dir, "running_times_raw.qs")
+)
+
+running_times <- running_times_raw %>%
+  group_by(
+    task_id, gene_set_size
+  ) %>%
+  summarize(
+    est_running_time = mean(time.running),
+    .groups = "drop"
+  )
+
+set.seed(42)
+# Planning jobs so that each one should take ~1h
+PLANNED_RUNNING_TIME <- 60*60
+prediction_task_job_sets_all <- prediction_task_gene_set_pairs_all %>%
+  power_inner_join(
+    running_times,
+    by = c("task_id", "gene_set_size"),
+    check = check_specs(
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn"
+    )
+  ) %>%
+  slice_sample(prop = 1) %>%
+  group_by(task_id) %>%
+  mutate(
+    batch_id = floor(cumsum(unclass(est_running_time)) / PLANNED_RUNNING_TIME)
+  ) %>%
+  ungroup() %>%
+  select(task_id, task_path, gs_id, batch_id, genes) %>%
+  group_nest(task_id, task_path, batch_id) %>%
+  mutate(
+    gene_sets = map(data, \(x) set_names(x$genes, x$gs_id))
+  )
+
+qsave(
+  prediction_task_job_sets_all, file.path(data_dir, "prediction_task_job_sets_all.qs")
+)
+# prediction_task_job_sets_all <- qread(file.path(data_dir, "prediction_task_job_sets_all.qs"))
+
+reg <- makeRegistry(
+  file.dir = here(paste0("registry_chromatin_modifiers_all_", gsub(" ", "_", Sys.time()))),
+  seed = 1
+)
+# reg <- loadRegistry("reg  ")
+
+batchMap(
+  fun = run_pred_job,
+  task_path = prediction_task_job_sets_all$task_path,
+  gene_sets = prediction_task_job_sets_all$gene_sets,
+  reg = reg
+)
+
+job_table <- findJobs(reg = reg) %>%
+  # Chunk jobs into a single array job
+  mutate(chunk = 1)
+
+submitJobs(
+  job_table[findExpired()],
+  resources = list(
+    memory = "1gb",
+    ncpus = 1L,
+    partition = "short",
+    walltime = 3*60*60,
+    chunks.as.arrayjobs = TRUE
+  ),
+  reg = reg
+)
+
+
+
+all_res_raw <- reduceResultsDataTable(
+  findDone(reg = reg), reg = reg
+)
+
+qsave(
+  all_res_raw,
+  file.path(data_dir, "all_res_raw.qs")
+)
+all_res_raw <- qread(file.path(data_dir, "all_res_raw.qs"))
+
+# background_res <- qread("driad/background_results_raw.qs")
+synStoreMany(
+  file.path(data_dir, "all_res_raw.qs"),
   "syn63901091", forceVersion = FALSE
 )
 
+all_res_joined <- all_res_raw %>%
+  unnest(result) %>%
+  rename(gs_id = Set) %>%
+  power_inner_join(
+    prediction_task_job_sets_all %>%
+      transmute(
+        job.id = seq_len(n()),
+        task_id
+      ),
+    by = c("job.id"),
+    check = check_specs(
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn"
+    )
+  ) %>%
+  power_inner_join(
+    prediction_task_gene_set_pairs_all %>%
+      select(-c(genes, task_path)),
+    by = c("task_id", "gs_id"),
+    check = check_specs(
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "warn"
+    )
+  )
+
+fwrite(
+  select(all_res_joined, where(negate(is.list))),
+  file.path(data_dir, "compound_and_background_res_all_only.csv.gz")
+)
+
+
+synStoreMany(
+  c(
+    file.path(
+      data_dir,
+      c(
+        "compound_and_background_res_all_only.csv.gz",
+        "prediction_task_gene_set_pairs_all_only.qs",
+        "prediction_tasks_all_only.qs"
+      )
+    )
+  ),
+  "syn63901091",
+  forceVersion = FALSE
+)

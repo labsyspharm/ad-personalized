@@ -441,5 +441,5 @@ p <- combined_res %>%
   theme(axis.text.y = element_text(hjust = 1, vjust = 0))
 
 ggsave(
-  "driad_plots/pcc_high_pooled_ridges_small.pdf", p, width = 5, height = 2.2
+  "driad_plots/pcc_high_pooled_ridges_small_rep_one.pdf", p, width = 5, height = 2.2
 )
