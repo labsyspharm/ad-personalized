@@ -7,6 +7,7 @@ library(qs)
 library(ComplexHeatmap)
 library(ggbeeswarm)
 library(broom)
+library(ggpubr)
 
 synapser::synLogin()
 syn <- synDownloader("~/data", .cache = TRUE)
@@ -117,10 +118,10 @@ pwalk(
   }
 )
 
-## Scatter plot
 
+## Compare the expression of ISGs between the two classes
 
-ps <- rosmap_quant_clinical_split %>%
+rosmap_quant_isg_data <- rosmap_quant_clinical_split %>%
   rowwise() %>%
   mutate(
     p_data = list(
@@ -140,7 +141,44 @@ ps <- rosmap_quant_clinical_split %>%
           across(expression, mean),
           .groups = "drop"
         )
+    )
+  ) %>%
+  ungroup()
+
+
+isg_expression_test_res <- rosmap_quant_isg_data %>%
+  mutate(
+    mw_raw = map(
+      p_data,
+      \(x) wilcox.test(
+        expression ~ `class`,
+        data = mutate(x, across(`class`, \(y) factor(y, levels = c("positive", "negative")))),
+        conf.int = TRUE
+      )
     ),
+    mw_res = map(mw_raw, tidy)
+  )
+
+isg_expression_test_res %>%
+  select(brain_region, classification, mw_res) %>%
+  unnest(mw_res)
+
+
+ps <- rosmap_quant_isg_data %>%
+  power_inner_join(
+    isg_expression_test_res %>%
+      select(brain_region, classification, mw_res) %>%
+      unnest(mw_res),
+    by = c("brain_region", "classification"),
+    check = check_specs(
+      duplicate_keys_left = "abort",
+      duplicate_keys_right = "abort",
+      unmatched_keys_left = "warn",
+      unmatched_keys_right = "abort"
+    )
+  ) %>%
+  rowwise() %>%
+  mutate(
     p = list(
       p_data %>%
         mutate(
@@ -154,7 +192,21 @@ ps <- rosmap_quant_clinical_split %>%
           )
         ) +
         geom_quasirandom(shape = 16, alpha = .8) +
-        theme_minimal()
+        geom_bracket(
+          aes(
+            xmin = cond_1, xmax = cond_2,
+            label = signif(p.value, 2)
+          ),
+          y.position = 2,
+          data = tibble(cond_1 = "positive", cond_2 = "negative", p.value = p.value),
+          inherit.aes = FALSE
+        ) +
+        theme_minimal() +
+        labs(
+          x = "TDP-43 prediction",
+          y = "Scaled log10(TPM + 1)",
+          color = "Expressed CEs"
+        )
     )
   ) %>%
   ungroup()
@@ -169,18 +221,6 @@ pwalk(
   }
 )
 
-isg_expression_test_res <- ps %>%
-  mutate(
-    mw_raw = map(
-      p_data,
-      \(x) wilcox.test(
-        expression ~ `class`,
-        data = mutate(x, across(`class`, \(y) factor(y, levels = c("positive", "negative")))),
-        conf.int = TRUE
-      )
-    ),
-    mw_res = map(mw_raw, tidy)
-  )
 
 isg_expression_test_res$mw_raw[[5]]
 
@@ -266,4 +306,56 @@ pwalk(
     file.path("plots", paste0("cryptic_exon_expression_overlap_alluvial_", brain_region, "_", class_threshold, ".pdf")),
     p, width = 6, height = 4
   )
+)
+
+
+
+# Check enrichment of genes enriched and depleted in the CRISPR screen
+
+crispr_raw <- syn("syn66477979") %>%
+  read_csv()
+
+library(enrichR)
+
+enrichr_raw <- enrichr(
+  crispr_raw %>%
+    arrange(desc(`Average LFC`)) %>%
+    head(n = 100) %>%
+    pull(`Gene Symbol`) %>%
+    unique(),
+  databases = "Reactome_Pathways_2024"
+)
+
+p <- enrichr_raw[[1]] %>%
+  as_tibble() %>%
+  mutate(
+    Term = fct_reorder(
+      Term, Odds.Ratio
+    )
+  ) %>%
+  head(n = 5) %>%
+  ggplot(
+    aes(
+      x = Odds.Ratio,
+      y = Term
+    )
+  ) +
+  geom_col() +
+  geom_text(
+    aes(
+      label = cut(Adjusted.P.value, breaks = c(-Inf, 0.001, 0.01, 0.05, Inf), labels = c("***", "**", "*", "ns"))
+    ),
+    nudge_x = 3
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(
+    x = "Enrichment Odds Ratio",
+    y = NULL
+  )
+
+ggsave(
+  here::here("plots", "crispr_enrichr_bars.pdf"),
+  p, width = 5, height = 1.6
 )
