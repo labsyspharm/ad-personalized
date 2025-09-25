@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J synapse_download
 #SBATCH -c 4                               # Request one core
-#SBATCH -t 0-3:00                         # Runtime in D-HH:MM format
+#SBATCH -t 0-8:00                         # Runtime in D-HH:MM format
 #SBATCH -p short                           # Partition to run in
 #SBATCH --mem=20G                         # Memory total in MiB (for all cores)
 #SBATCH -o synapse_download_%j.out                 # File to which STDOUT will be written, including job ID (%j)
@@ -12,9 +12,9 @@ set -eux
 # EXAMPLE sbatch download_synapse.sh selected_rosmap_samples.csv 2
 
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate base
+conda activate synapse
 
 cut -d, -f "$2" "$1" |
-  tail -n +1 |
-  parallel -j 8 --bar \
+  tail -n +2 |
+  parallel -j 4 --bar --halt now,fail=1 \
     synapse get --downloadLocation raw {}

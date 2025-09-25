@@ -203,7 +203,7 @@ pwalk(
         plot_dir,
         paste0("auc_", classification, "_", comparison, ".pdf")
       ),
-      plot, width = 14, height = 12
+      plot, width = 12, height = 8
     )
   }
 )

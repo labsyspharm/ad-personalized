@@ -18,9 +18,46 @@ rosmap_tdp43_classification <- syn("syn44277761") %>%
 rosmap_quant_clinical <- syn("syn44335073") %>%
   read_csv()
 
+rosmap_batch_meta <- syn("syn27034471") %>%
+  read_csv()
+
+rosmap_file_to_clinical_mapping <- syn("syn66532355") %>%
+  read_csv()
+
 # From Schoggins et al
 is_genes <- syn("syn11629935") %>%
   read_lines()
+
+rosmap_batch_annotation <- power_inner_join(
+  rosmap_quant_clinical %>%
+    select(ID),
+  rosmap_file_to_clinical_mapping %>%
+    distinct(
+      ID = file_prefix, specimen_id, individualID
+    ),
+  by = "ID",
+  check = check_specs(
+    duplicate_keys_left = "warn",
+    duplicate_keys_right = "warn",
+    unmatched_keys_left = "warn"
+  )
+) %>%
+  power_inner_join(
+    rosmap_batch_meta %>%
+      distinct(specimenID, batch = notes) %>%
+      mutate(
+        across(
+          specimenID,
+          \(x) str_remove(x, fixed("Sample_"))
+        )
+      ),
+    by = c("specimen_id" = "specimenID"),
+    check = check_specs(
+      duplicate_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_left = "warn"
+    )
+  )
 
 rosmap_quant_clinical_split <- rosmap_quant_clinical %>%
   mutate(
@@ -72,6 +109,55 @@ cluster_fun_eucl <- function(mat, sample_in_col = TRUE) {
   reorder(clust, dist_mat, method = "OLO")
 }
 
+createAnnotation <- function(df, colors = list(), which = "column") {
+  # Load necessary libraries
+  color_maps <- list()
+
+  # Iterate over each column in the dataframe
+  for (col_name in names(df)) {
+    # Check if the column is numeric
+    if (is.numeric(df[[col_name]])) {
+      # Create a color mapping function for numeric columns
+      if (is.null(colors[[col_name]]))
+        colors[[col_name]] <- c("white", "red")
+      if (is.function(colors[[col_name]])) {
+        col_fun <- colors[[col_name]]
+      } else if (is.character(colors[[col_name]])) {
+        n <- length(colors[[col_name]])
+        if (n == 1) {
+          col_fun <- circlize::colorRamp2(
+            seq(from = min(df[[col_name]]), to = max(df[[col_name]]), length.out = 100),
+            viridis(100, option = colors[[col_name]])
+          )
+        } else {
+          col_fun <- circlize::colorRamp2(
+            seq(from = min(df[[col_name]]), to = max(df[[col_name]]), length.out = n),
+            colors[[col_name]]
+          )
+        }
+      } else
+        stop("Dont know how to handle colors for column ", col_name)
+      color_maps[[col_name]] <- col_fun
+    } else {
+      if (is.character(colors[[col_name]])) {
+        color_maps[[col_name]] <- colors[[col_name]]
+        next
+      }
+      col_fun <- colors[[col_name]] %||% \(n) ggokabeito::palette_okabe_ito(seq_len(n))
+      # Create a named vector of colors for categorical columns
+      values <- df[[col_name]]
+      unique_values <- if (is.factor(values)) levels(values) else unique(df[[col_name]])
+      named_colors <- setNames(col_fun(length(unique_values)), unique_values)
+      color_maps[[col_name]] <- named_colors
+    }
+  }
+
+  # Combine all annotations
+  combined_annotations <- HeatmapAnnotation(df = df, col = color_maps, which = which)
+
+  return(combined_annotations)
+}
+
 
 hms <- rosmap_quant_clinical_split %>%
   rowwise() %>%
@@ -88,6 +174,16 @@ hms <- rosmap_quant_clinical_split %>%
     col_meta = list(
       data %>%
         select(ID, .data[["class"]], n_expressed) %>%
+        power_inner_join(
+          rosmap_batch_annotation %>%
+            select(ID, batch),
+          by = "ID",
+          check = check_specs(
+            duplicate_keys_left = "warn",
+            duplicate_keys_right = "warn",
+            unmatched_keys_left = "warn"
+          )
+        ) %>%
         column_to_rownames("ID")
     ),
     hm = Heatmap(
@@ -96,10 +192,13 @@ hms <- rosmap_quant_clinical_split %>%
       cluster_rows = cluster_fun_eucl,
       cluster_columns = cluster_fun_eucl,
       column_split = data$class,
-      top_annotation = HeatmapAnnotation(
-        df = col_meta,
+      top_annotation = createAnnotation(
+        col_meta %>%
+          select(-class),
         which = "column"
-      )
+      ),
+      show_row_names = FALSE,
+      show_column_names = FALSE
     ) %>%
       list()
   ) %>%
