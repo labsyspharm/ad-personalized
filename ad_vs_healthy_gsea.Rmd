@@ -14,6 +14,7 @@ library(data.table)
 library(synExtra)
 library(qs)
 library(powerjoin)
+library(ggrepel)
 
 synapser::synLogin()
 syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
@@ -350,20 +351,31 @@ p <- fgsea_res %>%
     fill = "gray"
     # adjust = .5
   ) +
-  geom_rug() +
+  geom_segment(
+    aes(xend = signed_p),
+    y = 0, yend = .1,
+    linewidth = .2
+  ) +
   geom_text_repel(
     aes(
       label = "ISG"
     ),
     data = \(x) filter(x, pathway == "isg"),
-    y = 0,
+    y = .1,
     ylim = c(.8, NA),
     color = "red",
     fontface = "bold",
     angle = 90,
+    hjust = 1,
+    vjust = 1,
     direction = "y"
   ) +
+  scale_x_continuous(
+    limits = c(0, NA),
+    expand = expansion(mult = 0)
+  ) +
   scale_y_continuous(expand = expansion(mult = c(0, .1))) +
+  coord_cartesian(clip = "off") +
   facet_wrap(
     vars(region_code),
     scales = "free_x"
@@ -371,14 +383,18 @@ p <- fgsea_res %>%
   labs(
     x = "-log10 adjusted p-value",
     y = "Density"
+  ) +
+  theme(
+    panel.spacing.x = unit(.3, "cm")
   )
+  # envalysis::theme_publish()
 p
 
 ggsave(
   file.path("plots", "fgsea_ad_vs_nci_isg_position_signed_p.pdf"),
   plot = p,
-  width = 6,
-  height = 4
+  width = 4,
+  height = 3
 )
 ```
 
