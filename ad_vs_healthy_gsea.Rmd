@@ -1,0 +1,504 @@
+---
+title: "AD vs healthy GSEA"
+author: "Clemens Hug"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(tidyverse)
+library(data.table)
+library(synExtra)
+library(qs)
+library(powerjoin)
+
+synapser::synLogin()
+syn <- synDownloader(normalizePath("~/data"), .cache = TRUE)
+```
+
+## Load data
+
+```{r}
+base_dir <- "~/HMS Dropbox/Clemens Hug/Laura AMP-AD figures/Human YN RNA-Seq with CI Denormalized"
+
+
+dge_files <- list.files(
+  base_dir,
+  pattern = "*.csv.gz"
+)
+```
+
+```{r}
+region_map <- c(
+  CBE = "Cerebellum",
+  TCX = "Temporal cortex",
+  FP  = "Frontal pole",
+  IFG = "Inferior frontal gyrus",
+  PHG = "Parahippocampal gyrus",
+  STG = "Superior temporal gyrus",
+  PFC = "Prefrontal cortex"
+)
+
+cohort_map <- c(
+  MayoBB = "Mayo Brain Bank",
+  MSBB   = "Mount Sinai Brain Bank",
+  ROSMAP = "Religious Orders Study & Memory and Aging Project"
+)
+
+dtype_map <- c(
+  RC   = "Raw counts",
+  CPM  = "Counts per million",
+  FPKM = "Fragments per kilobase per million"
+)
+
+phenotype_label <- function(x) {
+  dplyr::recode(
+    x,
+    ClinicalDiagnosis = "Clinical diagnosis",
+    CpDxAll   = "Consensus pathologic diagnosis (all)",
+    CpDxLow   = "Consensus pathologic diagnosis (low confidence)",
+    CpDxStrict= "Consensus pathologic diagnosis (strict)",
+    Braak     = "Braak NFT stage",
+    CERAD     = "CERAD neuritic plaque score",
+    CDR       = "Clinical Dementia Rating",
+    MMSE      = "Mini-Mental State Examination",
+    .default  = x
+  )
+}
+
+decode_group <- function(code, phenotype) {
+  if (is.na(code) || is.na(phenotype)) return(NA_character_)
+
+  if (phenotype == "Braak") {
+    n <- readr::parse_number(code)
+    if (is.na(n)) return(code)
+    return(paste0("Braak stage ", as.character(as.roman(n))))
+  }
+
+  if (phenotype == "CERAD") {
+    n <- readr::parse_number(code)
+    if (is.na(n)) return(code)
+    return(paste0("CERAD C", n))
+  }
+
+  # clinical / pathologic group codes
+  dplyr::recode(
+    code,
+    AD   = "Alzheimer’s disease",
+    NCI  = "No cognitive impairment (control)",
+    PA   = "Pathologic aging",
+    PSP  = "Progressive supranuclear palsy",
+    DNAD = "Dementia, non-AD",
+    PC   = "Pathologic control",
+    .default = code
+  )
+}
+
+phenotype_category <- function(x) {
+  dplyr::case_when(
+    x %in% c("ClinicalDiagnosis", "CDR", "MMSE") ~ "clinical",
+    grepl("^CpDx", x)                             ~ "pathology (consensus)",
+    x %in% c("Braak", "CERAD")                    ~ "neuropath staging",
+    TRUE                                          ~ "other"
+  )
+}
+
+# ---- main parser ----
+parse_filenames <- function(files) {
+  tibble(file = files) |>
+    # expected structure: Cohort_Region_DataType_Phenotype_Comparison.csv
+    tidyr::extract(
+      file,
+      into = c("cohort", "region_code", "data_type", "phenotype", "comparison"),
+      regex = "^([^_]+)_([^_]+)_([^_]+)_([^_]+)_([^.]+)\\.csv\\.gz$",
+      remove = FALSE
+    ) |>
+    # split comparison like AD-NCI, B2-B1, C3-C0, etc.
+    tidyr::separate(
+      comparison,
+      into = c("group1_code", "group2_code"),
+      sep  = "-",
+      remove = FALSE,
+      fill = "right"
+    ) |>
+    mutate(
+      cohort_full = dplyr::recode(cohort, !!!cohort_map),
+      region      = dplyr::recode(region_code, !!!region_map),
+      data_type_full = dplyr::recode(data_type, !!!dtype_map),
+      phenotype_label = phenotype_label(phenotype),
+      phenotype_category = phenotype_category(phenotype),
+      group1_label = mapply(decode_group, group1_code, phenotype, USE.NAMES = FALSE),
+      group2_label = mapply(decode_group, group2_code, phenotype, USE.NAMES = FALSE),
+      comparison_label = ifelse(
+        !is.na(group1_label) & !is.na(group2_label),
+        paste0(group1_label, " vs ", group2_label),
+        NA_character_
+      ),
+      # numeric stages (for Braak / CERAD only) to help with ordering
+      stage1_num = dplyr::case_when(
+        phenotype == "Braak" ~ suppressWarnings(readr::parse_number(group1_code)),
+        phenotype == "CERAD" ~ suppressWarnings(readr::parse_number(group1_code)),
+        TRUE ~ NA_real_
+      ),
+      stage2_num = dplyr::case_when(
+        phenotype == "Braak" ~ suppressWarnings(readr::parse_number(group2_code)),
+        phenotype == "CERAD" ~ suppressWarnings(readr::parse_number(group2_code)),
+        TRUE ~ NA_real_
+      )
+    ) |>
+    # nice column order
+    select(
+      file,
+      cohort, cohort_full,
+      region_code, region,
+      data_type, data_type_full,
+      phenotype, phenotype_label, phenotype_category,
+      comparison, group1_code, group1_label, group2_code, group2_label,
+      comparison_label, stage1_num, stage2_num
+    )
+}
+
+metadata <- parse_filenames(dge_files)
+```
+
+
+```{r}
+selected_meta <- metadata |>
+  filter(
+    region_code %in% c("PFC", "FP", "IFG", "PHG", "STG"),
+    phenotype == "CpDxAll",
+    comparison == "AD-NCI"
+  ) %>%
+  group_by(region_code) %>%
+  # If data_type RC available, prefer that, otherwise take whatever else is there
+  slice(
+    if (any(data_type == "RC")) {
+      which(data_type == "RC")[1]
+    } else {
+      1
+    }
+  ) %>%
+  ungroup()
+
+dge_raw <- selected_meta %>%
+  select(file, cohort, region_code) %>%
+  mutate(
+    data = map(file, \(x) read_csv(file.path(base_dir, x)))
+  ) %>%
+  unnest(data) %>%
+  mutate(
+    signed_p = -sign(logFC) * log10(PValue)
+  )
+```
+
+## FGSEA
+
+IS Genes are from Sudeshna's list
+
+```{r}
+library(fgsea)
+
+
+
+is_genes <- c("IFIH1", "DDX58", "IRF1", "IRF7", "CCL2", "MKX", "HSH2D", "SLC1A1",
+"LRG1", "SLFN5", "APOL2", "FBXO6", "MAB21L2", "IRF2", "C22orf28",
+"GZMB", "TNFAIP6", "PI4K2B", "PBEF1", "CCDC109B", "GK", "IFIT5",
+"ARG2", "MAFB", "SIRPA", "UPP2", "EIF2AK2", "LAP3", "GTPBP2",
+"BATF2", "GCH1", "SERPINE1", "PUS1", "PFKFB3", "MAP3K14", "BCL2L14",
+"ANGPTL1", "PDK1", "LGALS3", "IFNGR1", "SERPING1", "CRP", "IMPA2",
+"CYP1B1", "ALDH1A1", "TMEM49", "TNFSF13B", "HPSE", "TYMP", "TRIM14",
+"FAM70A", "CXCL9", "G6PC", "IGFBP2", "OASL", "PDGFRL", "CCL19",
+"GEM", "XAF1", "HLA-G", "C5orf39", "USP18", "JUNB", "C4orf33",
+"SAT3", "TNFSF10", "VEGFC", "CD80", "CCDC92", "C5orf27", "THBD",
+"CCL8", "ETV7", "MT1H", "NRN1", "C15orf48", "ADFP", "DDIT4",
+"LY6E", "TLR3", "P2RY6", "GBP2", "AGPAT9", "NCF1", "EPSTI1",
+"AIM2", "PNRC1", "STEAP4", "LGALS9", "PARP12", "IFI44", "CMAH",
+"PRAME", "CEBPD", "SECTM1", "COMMD3", "TMEM51", "PCTK2", "FAM125B",
+"BLVRA", "FUT4", "TRIM38", "CREB3L3", "VAMP5", "B2M", "CD69",
+"IRF9", "SOCS1", "SOCS2", "DEFB1", "CFB", "IFI35", "APOL1", "SLC25A28",
+"WARS", "CCL5", "C10orf10", "IFITM2", "IFIT1", "FLJ39739", "NUP50",
+"MYD88", "DYNLT1", "DTX3L", "NAPA", "CSDA", "NOD2", "NT5C3",
+"PMM2", "MT1F", "S100A8", "ISG15", "CES1", "IL17RB", "FNDC4",
+"MT1M", "NFIL3", "PXK", "ENPP1", "CASP7", "HES4", "IFI30", "EPAS1",
+"LGMN", "SSBP3", "PADI2", "PMAIP1", "FLJ23556", "EXT1", "KIAA1618",
+"MAX", "SCARB2", "MTHFD2L", "GTPBP1", "CTCFL", "SPTLC2", "IFI44L",
+"MT1X", "CCL4", "IL28RA", "CD9", "ZNF313", "FAM46C", "RPL22",
+"HLA-E", "NDC80", "RNASE4", "LINCR", "TRIM21", "ADAMDEC1", "HK2",
+"IFITM3", "GAK", "SP110", "ANKRD22", "SAA1", "CXCL10", "MT1G",
+"C2orf31", "HESX1", "ABTB2", "GMPR", "TNFRSF10A", "EIF3L", "DCP1A",
+"SMAD3", "BUB1", "BTN3A3", "KIAA0040", "PML", "MAP3K5", "OAS2",
+"TRIM5", "MAFF", "UBE2L6", "RASSF4", "TAP2", "CXCL11", "CDKN1A",
+"ZBP1", "CCDC75", "TREX1", "CCND3", "CPT1A", "CCR1", "CD74",
+"DHX58", "MSR1", "TDRD7", "HLA-C", "THOC4", "GLRX", "TLK2", "STAP1",
+"ATP10D", "SERPINB9", "AMPH", "SCO2", "ADM", "PHF15", "GPX2",
+"MX1", "IFI27", "AXUD1", "ANKFY1", "CLEC2B", "IFIT3", "IFI16",
+"FNDC3B", "LMO2", "Gluc", "PSCD1", "LIPA", "PRIC285", "IDO1",
+"TIMP1", "IFIT2", "RGS1", "ATF3", "HERC6", "GCA", "PIM3", "SAMHD1",
+"PNPT1", "SLC25A30", "IFI6", "CD38", "SPSB1", "STAT1", "TMEM140",
+"ZNF385B", "APOBEC3A", "TCF7L2", "TAP1", "FCGR1A", "TBX3", "ISG20",
+"CHMP5", "LAMP3", "BAG1", "SNN", "IL6ST", "PHF11", "IFI6", "UNC84B",
+"GBP5", "PTMA", "RARRES3", "MARCKS", "ETV6", "IL1RN", "PPM1K",
+"FKBP5", "GBP1", "MCL1", "FFAR2", "IL1R", "AKT3", "AHNAK2", "NPAS2",
+"RNF19B", "HEG1", "CCNA1", "C1S", "NMI", "DDX3X", "CLEC4E", "ODC1",
+"JAK2", "PSMB8", "ERLIN1", "GJA4", "GBP3", "IL15", "RIPK2", "ULK4",
+"IL15RA", "CD274", "PLSCR1", "MASTL", "C9orf91", "TXNIP", "RTP4",
+"ACSL1", "KIAA0082", "C4orf32", "SLC15A3", "MX1", "BCL3", "EHD4",
+"DUSP5", "AQP9", "GBP4", "MCOLN2", "PPM1K", "NCOA3", "WHDC1",
+"BST2", "CX3CL1", "STARD5", "TRIM34", "TAGAP", "ARNTL", "UNC93B1",
+"CLEC4D", "C6orf150", "SAMD4A", "SLC16A1", "FAM134B", "HLA-F",
+"FER1L3", "IFITM3", "PRKD2", "PSMB9", "OPTN", "ADAR", "TNFAIP3",
+"Fluc", "ABLIM3", "STAT2", "ARHGEF3", "MICB", "RBCK1", "OGFR",
+"ELF1", "CRY1", "DNAPTP6", "TRAFD1", "FAM46A", "TRIM25", "GALNT2",
+"CD163", "LEPR", "B4GALT5")
+
+library(msigdbr)
+
+kegg_medicus <- msigdbr(
+  collection = "C2", subcollection = "CP:KEGG_MEDICUS"
+)
+
+library(biomaRt)
+
+# Get biomart for human genes
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Map gene symbols to Ensembl IDs
+is_gene_mapping <- getBM(
+  attributes = c("hgnc_symbol", "ensembl_gene_id"),
+  filters = "hgnc_symbol",
+  values = is_genes,
+  mart = mart
+)
+
+gene_sets_all <- kegg_medicus %>%
+  split(.$gs_name) %>%
+  map("ensembl_gene") %>%
+  c(list(isg = unique(is_gene_mapping$ensembl_gene_id)))
+
+fgsea_res_raw <- dge_raw %>%
+  drop_na(GeneSymbol) %>%
+  group_nest(file) %>%
+  mutate(
+    vec = map(
+      data,
+      \(x) with(x, set_names(signed_p, EnsemblID))
+    ),
+    res = map(
+      vec,
+      \(x) fgseaMultilevel(
+        gene_sets_all,
+        x,
+        scoreType = "pos"
+        # nPermSimple = 10000
+      )
+    ),
+    enr_data = map(
+      vec,
+      \(x) plotEnrichmentData(
+        unique(is_gene_mapping$ensembl_gene_id),
+        x
+      )
+    )
+  )
+
+fgsea_res <- fgsea_res_raw %>%
+  dplyr::select(file, res) %>%
+  unnest(res) %>%
+  group_by(file) %>%
+  mutate(
+    signed_p = -sign(NES) * log10(padj),
+    rank_signed_p = rank(signed_p),
+    rank_NES = rank(NES),
+    pathway_name = str_remove(
+      pathway,
+      "KEGG_MEDICUS_[^_]*_"
+    ) %>%
+      str_replace_all(fixed("_"), " ")
+  ) %>%
+  ungroup() %>%
+  power_inner_join(
+    selected_meta,
+    by = "file",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  )
+```
+
+
+### Plot FGSEA results
+
+First plot the position of ISG in the distribution of all gene sets
+
+```{r}
+library(ggrepel)
+
+p <- fgsea_res %>%
+  ggplot(
+    aes(
+      signed_p
+    )
+  ) +
+  geom_density(
+    aes(
+      y = after_stat(ndensity)
+    ),
+    fill = "gray"
+    # adjust = .5
+  ) +
+  geom_rug() +
+  geom_text_repel(
+    aes(
+      label = "ISG"
+    ),
+    data = \(x) filter(x, pathway == "isg"),
+    y = 0,
+    ylim = c(.8, NA),
+    color = "red",
+    fontface = "bold",
+    angle = 90,
+    direction = "y"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, .1))) +
+  facet_wrap(
+    vars(region_code),
+    scales = "free_x"
+  ) +
+  labs(
+    x = "-log10 adjusted p-value",
+    y = "Density"
+  )
+p
+
+ggsave(
+  file.path("plots", "fgsea_ad_vs_nci_isg_position_signed_p.pdf"),
+  plot = p,
+  width = 6,
+  height = 4
+)
+```
+
+
+```{r}
+library(gt)
+
+fgsea_gt <- fgsea_res %>%
+  arrange(pval) %>%
+  transmute(
+    pathway = str_remove_all(
+      pathway, "KEGG_MEDICUS_[^_]+_"
+    ) %>%
+      str_replace_all(fixed("_"), " ") %>%
+      recode(isg = "ISG"),
+    region_code,
+    padj, NES
+  ) %>%
+  head(n = 15) %>%
+  gt() %>%
+  fmt_number(
+    columns = c(NES),
+    n_sigfig = 2
+  ) %>%
+  fmt_scientific(
+    columns = c(padj),
+    n_sigfig = 2
+  ) %>%
+  tab_style(
+    style = cell_text(color = "red", weight = "bold"),
+    locations = cells_body(
+      columns = pathway,
+      rows = pathway == "ISG"
+    )
+  ) %>%
+  opt_table_font(
+    font = "Helvetica"
+  )
+
+gtsave(
+  fgsea_gt,
+  file.path("plots", "fgsea_ad_vs_nci_table.html")
+)
+
+```
+
+
+```{r}
+fgsea_plot_data <- fgsea_res_raw %>%
+  dplyr::select(file, enr_data) %>%
+  unnest_wider(enr_data) %>%
+  summarize(
+    across(
+      where(is.list),
+      \(x) set_names(x, file) |>
+        bind_rows(.id = "file") |>
+        list()
+    ),
+    marks = pick(
+      where(negate(is.list))
+    ) %>%
+      list()
+  )
+
+# Create binned data for ribbon
+stats_data <- fgsea_plot_data$stats[[1]]
+n_bins <- 100
+stat_range <- range(stats_data$stat, na.rm = TRUE)
+bin_breaks <- seq(stat_range[1], stat_range[2], length.out = n_bins + 1)
+
+binned_stats <- stats_data %>%
+  mutate(
+    bin = cut(stat, breaks = bin_breaks, include.lowest = TRUE, labels = FALSE)
+  ) %>%
+  group_by(file, bin) %>%
+  summarise(
+    xmin = min(rank),
+    xmax = max(rank),
+    avg_stat = mean(stat, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+fgsea_plot <- ggplot(
+  fgsea_plot_data$curve[[1]],
+  aes(
+    rank, ES
+  )
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray", linewidth = 1) +
+  geom_line() +
+  geom_segment(
+    aes(x = rank, xend = rank),
+    data = fgsea_plot_data$ticks[[1]],
+    y = -.35, yend = -.25,
+    linewidth = .25
+  ) +
+  geom_rect(
+    aes(xmin = xmin, xmax = xmax, fill = avg_stat),
+    data = binned_stats,
+    ymin = -0.3, ymax = -0.35,
+    alpha = .95,
+    inherit.aes = FALSE
+  ) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  facet_wrap(~file) +
+  lims(
+    y = c(-0.32, 0.55)
+  ) +
+  labs(
+    x = "Expression rank",
+    y = "Enrichment Score",
+    fill = "Differential expression\nAD vs NCI"
+  )
+
+fgsea_plot
+
+ggsave(
+  file.path("plots", "fgsea_ad_vs_nci_isg.pdf"),
+  plot = fgsea_plot,
+  width = 10,
+  height = 8
+)
+```
