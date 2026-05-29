@@ -118,6 +118,16 @@ fastq_df_selected <- fastq_df %>%
       str_replace("_R[12]_001", "")
   )
 
+# From https://www.radc.rush.edu/docs/var/detail.htm?category=Clinical+Diagnosis&subcategory=Final+consensus+diagnosis&variable=cogdx
+cogdx_mapping <- tribble(
+  ~code, ~cogdx_primary, ~cogdx_other_causes, ~cogdx_full,
+  1, "NCI", FALSE, "NCI",
+  2, "MCI", FALSE, "MCI",
+  3, "MCI", TRUE, "MCI+other",
+  4, "AD", FALSE, "AD",
+  5, "AD", TRUE, "AD+other",
+  6, "Other dementia", TRUE, "Other dementia"
+)
 
 rosmap_file_to_clinical <- fastq_df_selected %>%
   distinct(specimen_id, file_prefix) %>%
@@ -144,6 +154,14 @@ rosmap_file_to_clinical <- fastq_df_selected %>%
       PMI = pmi, AOD = age_death, CDR = cogdx, Braak = braaksc
     ),
     by = "individualID",
+    check = check_specs(
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn"
+    )
+  ) |>
+  power_left_join(
+    cogdx_mapping,
+    by = c("CDR" = "code"),
     check = check_specs(
       unmatched_keys_left = "warn",
       duplicate_keys_right = "warn"
